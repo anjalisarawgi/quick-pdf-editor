@@ -92,13 +92,15 @@ async function load(newBytes, keepPage = false) {
 
 async function renderPage() {
   const page = await pdfDoc.getPage(current + 1);
-  const dpr = window.devicePixelRatio || 1;
-  viewport = page.getViewport({ scale: SCALE * dpr });   // render at device resolution
+  const dpr = Math.max(window.devicePixelRatio || 1, 2);  // supersample: at least 2x for crisp text
+  viewport = page.getViewport({ scale: SCALE * dpr });
   const c = $("page");
   c.width = viewport.width; c.height = viewport.height;
   c.style.width = viewport.width / dpr + "px";           // but display at CSS size
   c.style.height = viewport.height / dpr + "px";
-  await page.render({ canvasContext: c.getContext("2d"), viewport }).promise;
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  await page.render({ canvasContext: ctx, viewport }).promise;
   document.querySelectorAll(".thumb").forEach((t, i) => t.classList.toggle("active", i === current));
 }
 
@@ -107,7 +109,7 @@ async function renderThumbs() {
   box.innerHTML = "";
   for (let i = 0; i < pdfDoc.numPages; i++) {
     const page = await pdfDoc.getPage(i + 1);
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.max(window.devicePixelRatio || 1, 2);
     const vp = page.getViewport({ scale: 0.25 * dpr });
     const div = document.createElement("div");
     div.className = "thumb";
@@ -227,6 +229,12 @@ $("page").addEventListener("click", async e => {
       const ly = -dx * Math.sin(th) + dy * Math.cos(th);
       if (lx >= 0 && lx <= it.width && ly >= -0.25 * h && ly <= h) { hit = { it, th, h }; break; }
     }
+    if (hit) {
+      // A currency symbol is often its own text run just left of the number; treat them as one.
+      const [, , , , hx, hy] = hit.it.transform;
+      hit.prefix = content.items.find(o => /^[€$£¥]$/.test(o.str.trim()) &&
+        Math.abs(o.transform[5] - hy) < 0.5 && Math.abs(o.transform[4] + o.width - hx) < 2) || null;
+    }
     if (!hit) return setStatus("No text there. Click directly on a word (or switch to Add new text)");
   }
 
@@ -238,16 +246,20 @@ $("page").addEventListener("click", async e => {
       const font = await doc.embedFont(StandardFonts.Helvetica);
       const p = doc.getPage(current);
       if (hit) {
-        const { it, th, h } = hit, [, , , , ex, ey] = it.transform;
+        const { it, th, h, prefix } = hit, [, , , , ex, ey] = it.transform;
+        const sx = prefix ? prefix.transform[4] : ex;   // start of the whole run, symbol included
+        const runW = ex + it.width - sx;
         const deg = th * 180 / Math.PI;
-        let x0 = ex - 1, x1 = ex + it.width + 1, maxW = Infinity;
+        let x0 = sx - 1, x1 = ex + it.width + 1, maxW = Infinity, rightAlign = false;
         if (viewport.rotation === 0 && Math.abs(th) < 1e-3) {
           // Keep inside the cell so borders survive and text doesn't spill out.
           const [, , , , cx, cy] = pdfjsLib.Util.transform(viewport.transform, it.transform);
           const cell = cellBounds(cx, cy, h * viewport.scale);
           x0 = Math.max(x0, cell.left / viewport.scale + 1);
           x1 = Math.min(x1, cell.right / viewport.scale - 1);
-          maxW = cell.right / viewport.scale - 1.5 - ex;
+          maxW = cell.right / viewport.scale - 1.5 - sx;
+          // Numbers are usually right-aligned: keep the new text flush with the old run's right edge.
+          rightAlign = cell.right / viewport.scale - (ex + it.width) < sx - cell.left / viewport.scale;
         }
         const c = Math.cos(th), s = Math.sin(th), oy = -0.2 * h;
         const ox = x0 - ex;
@@ -257,10 +269,15 @@ $("page").addEventListener("click", async e => {
           rotate: degrees(deg), color: rgb(1, 1, 1), borderWidth: 0,
         });
         if (text) {
+          const sym = prefix ? prefix.str.trim() : "";
+          const num = text.replace(/[€$£¥]/g, "").trim();   // keep the original symbol, don't duplicate it
           let size = h;
-          const w = font.widthOfTextAtSize(text, size);
-          if (w > maxW) size = size * maxW / w;   // shrink to fit the cell
-          p.drawText(text, { x: ex, y: ey, size, font, color, rotate: degrees(deg) });
+          const total = sz => font.widthOfTextAtSize(sym + num, sz) + (sym ? 0.18 * sz : 0);   // small gap after the symbol
+          if (total(size) > maxW) size = size * maxW / total(size);   // shrink to fit the cell
+          const dxText = (rightAlign ? runW - total(size) : 0) + (sx - ex);
+          const put = (str, d) => p.drawText(str, { x: ex + d * c, y: ey + d * s, size, font, color, rotate: degrees(deg) });
+          if (sym) put(sym, dxText);
+          put(num, dxText + (sym ? font.widthOfTextAtSize(sym, size) + 0.18 * size : 0));
         }
       } else {
         // Counter-rotate so text reads upright on rotated pages.
